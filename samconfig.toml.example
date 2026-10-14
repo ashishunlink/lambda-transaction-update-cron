@@ -1,0 +1,9 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "pending-transaction-update-cron"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+region = "us-east-2"
+parameter_overrides = "ScheduleExpression='rate(15 minutes)' ScheduleTimezone='UTC' DBHost='gatewaydb-instance.example.us-east-2.rds.amazonaws.com' DBPort='5432' DBName='gatewaydb' DBUser='masteruser' DBPassword='replace-me' DBSSL='false' SkipLastMinutes='15' ConsiderLastMinutes='1440' VpcSubnetIds='subnet-abc123,subnet-def456' VpcSecurityGroupIds='sg-abc123'"

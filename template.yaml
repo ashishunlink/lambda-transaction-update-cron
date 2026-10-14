@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Pending transaction update Lambda invoked by EventBridge Scheduler.
+
+Parameters:
+  ScheduleExpression:
+    Type: String
+    Default: rate(15 minutes)
+    Description: EventBridge Scheduler expression.
+  ScheduleTimezone:
+    Type: String
+    Default: UTC
+    Description: IANA timezone for the schedule.
+  DBHost:
+    Type: String
+    Description: PostgreSQL host name.
+  DBPort:
+    Type: Number
+    Default: 5432
+    Description: PostgreSQL port.
+  DBName:
+    Type: String
+    Description: PostgreSQL database name.
+  DBUser:
+    Type: String
+    Description: PostgreSQL user.
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: PostgreSQL password.
+  DBSSL:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Set true when the database requires SSL.
+  SkipLastMinutes:
+    Type: Number
+    Default: 15
+    Description: Skip the newest N minutes to avoid touching in-flight transactions.
+  ConsiderLastMinutes:
+    Type: Number
+    Default: 1440
+    Description: Consider transactions created within the last N minutes.
+  VpcSubnetIds:
+    Type: String
+    Default: ''
+    Description: Comma-separated private subnet IDs for Lambda VPC access.
+  VpcSecurityGroupIds:
+    Type: String
+    Default: ''
+    Description: Comma-separated security group IDs for Lambda VPC access.
+
+Conditions:
+  UseVpc: !And
+    - !Not [!Equals [!Ref VpcSubnetIds, '']]
+    - !Not [!Equals [!Ref VpcSecurityGroupIds, '']]
+
+Resources:
+  PendingTransactionUpdateFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+  PendingTransactionUpdateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: pending-transaction-update-cron
+      CodeUri: ./
+      Handler: src/index.handler
+      Runtime: nodejs20.x
+      MemorySize: 256
+      Timeout: 120
+      Role: !GetAtt PendingTransactionUpdateFunctionRole.Arn
+      Environment:
+        Variables:
+          DB_HOST: !Ref DBHost
+          DB_PORT: !Ref DBPort
+          DB_NAME: !Ref DBName
+          DB_USER: !Ref DBUser
+          DB_PASSWORD: !Ref DBPassword
+          DB_SSL: !Ref DBSSL
+          SKIP_LAST_MINUTES: !Ref SkipLastMinutes
+          CONSIDER_LAST_MINUTES: !Ref ConsiderLastMinutes
+      VpcConfig: !If
+        - UseVpc
+        - SecurityGroupIds: !Split [',', !Ref VpcSecurityGroupIds]
+          SubnetIds: !Split [',', !Ref VpcSubnetIds]
+        - !Ref AWS::NoValue
+
+  PendingTransactionUpdateSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokePendingTransactionUpdateLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt PendingTransactionUpdateFunction.Arn
+                  - !Sub '${PendingTransactionUpdateFunction.Arn}:*'
+
+  PendingTransactionUpdateSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Runs the pending transaction update Lambda on a recurring schedule.
+      FlexibleTimeWindow:
+        Mode: OFF
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      State: ENABLED
+      Target:
+        Arn: !GetAtt PendingTransactionUpdateFunction.Arn
+        RoleArn: !GetAtt PendingTransactionUpdateSchedulerRole.Arn
+        Input: '{}'
+
+Outputs:
+  FunctionName:
+    Value: !Ref PendingTransactionUpdateFunction
+  FunctionArn:
+    Value: !GetAtt PendingTransactionUpdateFunction.Arn
+  ScheduleName:
+    Value: !Ref PendingTransactionUpdateSchedule
