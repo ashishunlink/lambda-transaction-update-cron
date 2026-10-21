@@ -9,10 +9,10 @@ const DEFAULT_SKIP_LAST_MINUTES = 15;
 const DEFAULT_CONSIDER_LAST_MINUTES = 1440;
 const FROM_EVENT = "PENDING";
 const FROM_STATUS = "PENDING";
-const TO_STATUS = 'NOTSUCCESSFUL';
-const TIMEOUT_EVENT = 'TIMEOUT';
-const GATEWAY_ERROR = 'Session timeout.';
-const RESPONSE_CODE_ID = 68;
+let TO_STATUS = 'NOTSUCCESSFUL';
+let TIMEOUT_EVENT = 'TIMEOUT';
+let GATEWAY_ERROR = 'Session timeout.';
+let RESPONSE_CODE_ID = -1;
 const EXCLUDED_TRANSACTION_TYPE = 'REFUND';
 
 function getIntEnv(name: string, defaultValue: number) {
@@ -32,6 +32,32 @@ function getIntEnv(name: string, defaultValue: number) {
 function formatUtcTimestamp(date: Date) {
   const iso = date.toISOString();
   return `${iso.slice(0, 19).replace('T', ' ')}.000`;
+}
+
+function formatTransactionTimestamp(value: unknown): string {
+  if (value == null || value === '') {
+    return '';
+  }
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? '' : value.toISOString();
+  }
+
+  let raw = String(value).trim();
+  if (!raw.includes('T') && raw.includes(' ')) {
+    raw = raw.replace(' ', 'T');
+  }
+
+  raw = raw.replace(/([+-]\d{2})$/, '$1:00');
+  raw = raw.replace(/([+-]\d{4})$/, (_, offset: string) => `${offset.slice(0, 3)}:${offset.slice(3)}`);
+
+  const hasZone = /(?:Z|[+-]\d{2}:\d{2})$/i.test(raw);
+  const date = new Date(hasZone ? raw : `${raw}Z`);
+  if (Number.isNaN(date.getTime())) {
+    return String(value);
+  }
+
+  return date.toISOString();
 }
 
 function buildWindow() {
@@ -68,6 +94,7 @@ async function createClient() {
   });
 
   await client.connect();
+
   return client;
 }
 
@@ -83,6 +110,9 @@ async function closeDatabaseConnection(client: PgClient) {
 }
 
 async function updatePendingTransactions(client: PgClient, startDate: string, endDate: string) {
+
+  console.log("updatePendingTransactions=========================", startDate, endDate);
+  
   const sqlTransaction = `
     SELECT
       to_jsonb(t) AS transaction,
@@ -90,16 +120,17 @@ async function updatePendingTransactions(client: PgClient, startDate: string, en
       to_jsonb(p) AS product,
       to_jsonb(l) AS locations
     FROM "Transaction" t
-    LEFT JOIN "Merchant" m
-      ON m."MerchantID" = t."MerchantID"
     LEFT JOIN "Locations" l
       ON l."DASMID" = t."DASMID"
+    LEFT JOIN "Merchant" m
+      ON m."MerchantID" = l."MerchantID"
     LEFT JOIN "Products" p
       ON p."ProductID" = COALESCE(t."ProductID", l."ProductID")
     WHERE t."TransactionType" NOT IN ($1)
       AND t."event" IN ($2)
       AND t."status" = $3
       AND t."CreatedAt" BETWEEN $4 AND $5
+      AND t."Scheme" != $6
     ORDER BY t."CreatedAt" DESC
   `;
 
@@ -109,16 +140,22 @@ async function updatePendingTransactions(client: PgClient, startDate: string, en
     FROM_STATUS,
     startDate,
     endDate,
+    "paynow",
   ]);
 
-  console.log("sqlTransaction=========================", sqlTransaction, [
-    EXCLUDED_TRANSACTION_TYPE,
-    FROM_EVENT,
-    FROM_STATUS,
-    startDate,
-    endDate,
-  ]);
-  console.log("transaction.rows=========================", transaction.rows.length);
+  const rows = uniqueTransactionRows(transaction.rows);
+
+  console.log(
+    JSON.stringify({
+      message: 'Pending transactions selected',
+      selected: transaction.rows.length,
+      unique: rows.length,
+      transactions: rows.map((row) => ({
+        uuid: row.transaction?.uuid,
+        webhookUrl: getWebhookUrl(row.transaction),
+      })),
+    }),
+  );
 
   const transactionUpdate = `
     UPDATE "Transaction"
@@ -126,7 +163,8 @@ async function updatePendingTransactions(client: PgClient, startDate: string, en
       "event" = $1,
       "ResponseCodeID" = $2,
       "status" = $3,
-      "GatewayError" = $4
+      "GatewayError" = $4,
+      "UpdatedAt" = (NOW() AT TIME ZONE 'UTC')
     WHERE uuid = ANY($5::varchar[])
       AND "TransactionType" NOT IN ($6)
       AND "event" = $7
@@ -134,20 +172,26 @@ async function updatePendingTransactions(client: PgClient, startDate: string, en
     RETURNING uuid, status, event;
   `;
 
-  const updateResult = await client.query(transactionUpdate, [
-    TIMEOUT_EVENT,
-    RESPONSE_CODE_ID,
-    TO_STATUS,
-    GATEWAY_ERROR,
-    transaction.rows.map((row) => row.transaction.uuid),
-    EXCLUDED_TRANSACTION_TYPE,
-    FROM_EVENT,
-    FROM_STATUS,
-  ]);
+  const updatedRows: { uuid: string; status: string; event: string }[] = [];
+  let databaseQueue: Promise<unknown> = Promise.resolve();
 
-  for (const [index, row] of transaction.rows.entries()) {
+  const enqueueDatabase = <T>(task: () => Promise<T>): Promise<T> => {
+    const run = databaseQueue.then(task, task);
+    databaseQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+
+  await eachWithConcurrency(rows, 10, async (row, index) => {
     const uuid = row.transaction?.uuid;
     const webhookUrl = getWebhookUrl(row.transaction);
+
+    if (!uuid) {
+      return;
+    }
+
     try {
       if (!webhookUrl) {
         console.log(
@@ -155,24 +199,23 @@ async function updatePendingTransactions(client: PgClient, startDate: string, en
             message: 'Skipping webhook, no URL',
             uuid,
             index,
-            total: transaction.rows.length,
+            total: rows.length,
           }),
         );
-        continue;
+      } else {
+        console.log(
+          JSON.stringify({
+            message: 'Sending webhook',
+            uuid,
+            webhookUrl,
+            index,
+            total: rows.length,
+          }),
+        );
+
+        const dataRes = await getPaymentResponse(row);
+        await callApi(webhookUrl, dataRes, uuid);
       }
-
-      console.log(
-        JSON.stringify({
-          message: 'Sending webhook',
-          uuid,
-          webhookUrl,
-          index,
-          total: transaction.rows.length,
-        }),
-      );
-
-      const dataRes = await getPaymentResponse(row);
-      await callApi(webhookUrl, dataRes, uuid);
     } catch (error) {
       console.error(
         JSON.stringify({
@@ -180,16 +223,181 @@ async function updatePendingTransactions(client: PgClient, startDate: string, en
           uuid,
           webhookUrl,
           index,
-          total: transaction.rows.length,
+          total: rows.length,
           error: error instanceof Error ? error.message : String(error),
         }),
       );
     }
-  }
+
+    const updateResult = await enqueueDatabase(() =>
+      client.query(transactionUpdate, [
+        TIMEOUT_EVENT,
+        RESPONSE_CODE_ID,
+        TO_STATUS,
+        GATEWAY_ERROR,
+        [uuid],
+        EXCLUDED_TRANSACTION_TYPE,
+        FROM_EVENT,
+        FROM_STATUS,
+      ]),
+    );
+    updatedRows.push(...updateResult.rows);
+  });
 
   return {
-    rowCount: updateResult.rowCount,
-    rows: updateResult.rows,
+    rowCount: updatedRows.length,
+    rows: updatedRows,
+  };
+}
+
+async function updatePendingUOBTransactions(client: PgClient, startDate: string, endDate: string) {
+
+  console.log("updatePendingUOBTransactions=========================", startDate, endDate);
+
+  const sqlTransaction = `
+    SELECT
+      to_jsonb(t) AS transaction,
+      to_jsonb(m) AS merchant,
+      to_jsonb(p) AS product,
+      to_jsonb(l) AS locations
+    FROM "Transaction" t
+    LEFT JOIN "Locations" l
+      ON l."DASMID" = t."DASMID"
+    LEFT JOIN "Merchant" m
+      ON m."MerchantID" = l."MerchantID"
+    LEFT JOIN "Products" p
+      ON p."ProductID" = COALESCE(t."ProductID", l."ProductID")
+    WHERE t."TransactionType" NOT IN ($1)
+      AND t."event" IN ($2)
+      AND t."status" = $3
+      AND t."CreatedAt" BETWEEN $4 AND $5
+      AND t."Scheme" = $6
+    ORDER BY t."CreatedAt" DESC
+  `;
+
+  const transaction = await client.query(sqlTransaction, [
+    EXCLUDED_TRANSACTION_TYPE,
+    FROM_EVENT,
+    FROM_STATUS,
+    startDate,
+    endDate,
+    "paynow",
+  ]);
+
+  const rows = uniqueTransactionRows(transaction.rows);
+
+  console.log(
+    JSON.stringify({
+      message: 'Pending transactions selected',
+      selected: transaction.rows.length,
+      unique: rows.length,
+      transactions: rows.map((row) => ({
+        uuid: row.transaction?.uuid,
+        webhookUrl: getWebhookUrl(row.transaction),
+      })),
+    }),
+  );
+
+  const transactionUpdate = `
+    UPDATE "Transaction"
+    SET
+      "event" = $1,
+      "ResponseCodeID" = $2,
+      "status" = $3,
+      "GatewayError" = $4,
+      "UpdatedAt" = (NOW() AT TIME ZONE 'UTC')
+    WHERE uuid = ANY($5::varchar[])
+      AND "TransactionType" NOT IN ($6)
+      AND "event" = $7
+      AND "status" = $8
+    RETURNING uuid, status, event;
+  `;
+
+  const updatedRows: { uuid: string; status: string; event: string }[] = [];
+  let databaseQueue: Promise<unknown> = Promise.resolve();
+
+  const enqueueDatabase = <T>(task: () => Promise<T>): Promise<T> => {
+    const run = databaseQueue.then(task, task);
+    databaseQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+
+  await eachWithConcurrency(rows, 10, async (row, index) => {
+    const uuid = row.transaction?.uuid;
+    const webhookUrl = getWebhookUrl(row.transaction);
+
+    if (!uuid) {
+      return;
+    }
+
+    //Get UOB Transaction Status from UOB Service
+    const uobTransactionStatus: any = await getUOBTransactionStatus(row.transaction?.ID, row.transaction?.CreatedAt.split("T")[0]);
+
+    if(uobTransactionStatus?.account?.transactions?.length > 0) {
+      TO_STATUS = "SUCCESSFUL";
+      TIMEOUT_EVENT = "CAPTURED";
+      RESPONSE_CODE_ID = 0;
+      GATEWAY_ERROR = "";
+    }
+
+    try {
+      if (!webhookUrl) {
+        console.log(
+          JSON.stringify({
+            message: 'Skipping webhook, no URL',
+            uuid,
+            index,
+            total: rows.length,
+          }),
+        );
+      } else {
+        console.log(
+          JSON.stringify({
+            message: 'Sending webhook',
+            uuid,
+            webhookUrl,
+            index,
+            total: rows.length,
+          }),
+        );
+
+        const dataRes = await getPaymentResponse(row);
+        await callApi(webhookUrl, dataRes, uuid);
+      }
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          message: 'Error calling webhook',
+          uuid,
+          webhookUrl,
+          index,
+          total: rows.length,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    }
+
+    const updateResult = await enqueueDatabase(() =>
+      client.query(transactionUpdate, [
+        TIMEOUT_EVENT,
+        RESPONSE_CODE_ID,
+        TO_STATUS,
+        GATEWAY_ERROR,
+        [uuid],
+        EXCLUDED_TRANSACTION_TYPE,
+        FROM_EVENT,
+        FROM_STATUS,
+      ]),
+    );
+    updatedRows.push(...updateResult.rows);
+  });
+
+  return {
+    rowCount: updatedRows.length,
+    rows: updatedRows,
   };
 }
 
@@ -227,9 +435,48 @@ async function deleteOldTransactionCustomerInfo(client: PgClient, endDate: strin
   return result;
 }
 
+function uniqueTransactionRows(rows: any[]) {
+  const seen = new Set<string>();
+  const unique = [];
+
+  for (const row of rows) {
+    const uuid = row?.transaction?.uuid;
+    if (uuid == null || uuid === '' || seen.has(String(uuid))) {
+      continue;
+    }
+
+    seen.add(String(uuid));
+    unique.push(row);
+  }
+
+  return unique;
+}
+
+async function eachWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<void>,
+) {
+  if (items.length === 0) {
+    return;
+  }
+
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      await worker(items[index], index);
+    }
+  });
+
+  await Promise.all(workers);
+}
+
 function getWebhookUrl(transaction: any): string {
   const url =
     transaction?.WebhookUrl ??
+    transaction?.WebhookURL ??
     transaction?.webhookurl ??
     transaction?.webhook_url ??
     "";
@@ -288,6 +535,26 @@ async function callApi(url: string, data: IpaymentRes | IdefaultErrorRes,reqid:s
   }
 }
 
+async function getUOBTransactionStatus(transactionID: number, createdAt: string): Promise<string> {
+
+  const url = `${process.env.UOB_SERVICE_PATH}/api/v1/uob/account-transaction-history-search`;
+
+  const transactionDT = `${createdAt.split("-")[2]}${createdAt.split("-")[1]}${createdAt.split("-")[0]}`;
+
+  const data = {
+    "fromDate": transactionDT,
+    "toDate": transactionDT,
+    "fromTime": "00:00",
+    "toTime": "23:59",
+    "transactionText": transactionID.toString()
+  }
+
+  console.log("Request Payload UOB Status=========================", data);
+
+  const response = await axios.post(url, data);
+  return response.data;
+}
+
 async function getPaymentResponse(request: any): Promise<IpaymentRes> {
   let reqBody = request;
 
@@ -306,17 +573,18 @@ async function getPaymentResponse(request: any): Promise<IpaymentRes> {
     "country": reqBody?.transaction?.bill_country || "",
     "email": reqBody?.transaction?.bill_email || "",
     "address1": reqBody?.transaction?.bill_address1 || "",
-    "address2": reqBody?.transaction?.bill_address2 || "",
+    //"address2": reqBody?.transaction?.bill_address2 || "",
     "city": reqBody?.transaction?.bill_city || "",
     "state": reqBody?.transaction?.bill_state || "",
-    "postal_code": reqBody?.transaction?.bill_postal || ""
+    "postal_code": reqBody?.transaction?.bill_postal || "",
+    "phone_number": reqBody?.transaction?.bill_phone || "",
   }
 
   reqBody.shipping_address = {
     "country": reqBody?.transaction?.ship_country || "",
     "email": reqBody?.transaction?.ship_email || "",
     "address1": reqBody?.transaction?.ship_address || "",
-    "address2": reqBody?.transaction?.ship_address2 || "",
+    //"address2": reqBody?.transaction?.ship_address2 || "",
     "city": reqBody?.transaction?.ship_city || "",
     "state": reqBody?.transaction?.ship_state || "",
     "postal_code": reqBody?.transaction?.ship_postal || "",
@@ -330,16 +598,16 @@ async function getPaymentResponse(request: any): Promise<IpaymentRes> {
   
   return {
     "success": false,
-    "status_code": 408,
+    "status_code": 400,
     "is_live": false,
-    "transaction_type": reqBody?.transaction?.TransactionType == "AUTHORISATION" ? "PRE_AUTH" : reqBody?.transaction?.TransactionType,
+    "transaction_type": reqBody?.transaction?.TransactionType == "AUTHORISATION" ? "PRE_AUTH" : "CAPTURE",
     "gateway_response": {
       "version": "1",
       "type": "ERROR",
       "message": GATEWAY_ERROR,
-      "code": RESPONSE_CODE_ID.toString()
+      "code": "ERR0002"
     },
-    "return_url_details": reqBody?.return_url || {},
+    //"return_url_details": reqBody?.return_url || {},
     "merchant_details": {
       "legal_name": reqBody?.merchant?.LegalName || "",
       "mid": reqBody.merchant_id || "",
@@ -347,49 +615,54 @@ async function getPaymentResponse(request: any): Promise<IpaymentRes> {
         "billing_address": reqBody.billing_address || {},
         "shipping_address": reqBody.shipping_address || {}
       },
-      "device_details": {
+      "merchant_txn_ref": reqBody.merchant_txn_ref || ""
+      /*"device_details": {
         ...(reqBody.link_generated_ip && { "visited_ip": reqBody.link_generated_ip || "", "merchant_ip": reqBody.link_generated_ip || "" }),
         ...(reqBody.visit_ip && { "customer_ip": reqBody.visit_ip || "" }),
-      }
+      }*/
     },
     "payment_details": {
       "amount": reqBody.amount || "",
-      "response_code": RESPONSE_CODE_ID.toString(),
-      "auth_code": "",
+      "response_code": RESPONSE_CODE_ID,
+      "auth_code": null,
       "currency": reqBody.currency,
-      "payment_method": reqBody?.transaction?.PaymentMethodType || "",
+      "payment_method": reqBody?.transaction?.PaymentMethodType || "card",
       "scheme": getSchemes(reqBody?.transaction),
       "card": getCardInfo(reqBody?.transaction),
       "additional_data":{
           "payment_data_source":{
-             "type": reqBody?.transaction?.PaymentMethodType || ""
+             "type": reqBody?.transaction?.PaymentMethodType || "card"
           },
           ...(reqBody?.transaction?.additional_data?.serviceOptions && { "service_options": reqBody.transaction.additional_data.serviceOptions })
-        }
+        },
+      "responseDescription": reqBody?.transaction?.GatewayError || ""
     },
     "transaction_details": {
       ...(reqBody?.transaction && {
         "id": reqBody.transaction.uuid,
         "ref": reqBody.transaction.ID,
-        "timestamp": reqBody.transaction.TransactionDate
-      }),
-      "merchant_txn_ref": reqBody.merchant_txn_ref || "",
+        "merchant_txn_ref": reqBody.merchant_txn_ref || "",
+        "timestamp": formatTransactionTimestamp(reqBody.transaction.TransactionDate)
+      })
     },
     ...(reqBody?.transaction?.Subscription && {
       "subscription_details": {}
-    })
+    }),
+    "risk-details": {
+        "risk_score": null
+    }
   }
 }
 
 function getSchemes(transaction: any) {
-  if( (transaction?.PaymentMethodType !== "card" && !WalletWithScheme.includes(transaction?.PaymentMethodType)) || (transaction?.PaymentMethodType === transaction?.Scheme )) {
+  /*if( (transaction?.PaymentMethodType !== "card" && !WalletWithScheme.includes(transaction?.PaymentMethodType)) || (transaction?.PaymentMethodType === transaction?.Scheme )) {
     return "";
-  }
+  }*/
   return transaction?.Scheme || "";
 }
 
 function getCardInfo(transaction: any) {
-  if( transaction?.PaymentMethodType !== "card" && !WalletWithScheme.includes(transaction?.PaymentMethodType)){
+  /*if( transaction?.PaymentMethodType !== "card" && !WalletWithScheme.includes(transaction?.PaymentMethodType)){
     return {
       "name": "",
       "number": "",
@@ -403,7 +676,7 @@ function getCardInfo(transaction: any) {
       "exp_month": "",
       "exp_year": ""
     };
-  }
+  }*/
   return {
     "name": transaction?.CardHolderName || "",
     "number": transaction?.CardNumber || "",
@@ -427,6 +700,11 @@ exports.handler = async (event = {}) => {
 
   try {
     const pendingResult = await updatePendingTransactions(
+      client,
+      window.startDate,
+      window.endDate,
+    );
+    const pendingUOBResult = await updatePendingUOBTransactions(
       client,
       window.startDate,
       window.endDate,

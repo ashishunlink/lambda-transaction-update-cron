@@ -162,7 +162,8 @@ export interface IpaymentRes {
             "payment_data_source"?:{
                 "type"?:string
             }
-        }
+        },
+        "responseDescription"?: string;
     };
     "transaction_details"?: {
         "id"?: string;
