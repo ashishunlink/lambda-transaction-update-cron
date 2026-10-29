@@ -336,6 +336,14 @@ async function updatePendingUOBTransactions(client: PgClient, startDate: string,
     //Get UOB Transaction Status from UOB Service
     const uobTransactionStatus: any = await getUOBTransactionStatus(row.transaction?.ID, row.transaction?.CreatedAt.split("T")[0]);
 
+    //Check if transactions key not present in account object, then transaction is not found in UOB
+    if(uobTransactionStatus?.account?.description === "No record found from search") {
+      TO_STATUS = "NOTSUCCESSFUL";
+      TIMEOUT_EVENT = "TIMEOUT";
+      RESPONSE_CODE_ID = -1;
+      GATEWAY_ERROR = "Session timeout.";
+    }
+
     if(uobTransactionStatus?.account?.transactions?.length > 0) {
       TO_STATUS = "SUCCESSFUL";
       TIMEOUT_EVENT = "CAPTURED";
@@ -364,7 +372,7 @@ async function updatePendingUOBTransactions(client: PgClient, startDate: string,
           }),
         );
 
-        const dataRes = await getPaymentResponse(row);
+        const dataRes = await getUOBPaymentResponse(row);
         await callApi(webhookUrl, dataRes, uuid);
       }
     } catch (error) {
@@ -522,7 +530,14 @@ async function callApi(url: string, data: IpaymentRes | IdefaultErrorRes,reqid:s
           response: response.data,
         }),
       );
+
+      //Save Webhook in Logs
+      await saveResponse(reqid, "WEBHOOK", { url : url, payload : data, response : "failed" });
     }
+
+    //Save Webhook in Logs
+    await saveResponse(reqid, "WEBHOOK", { url : url, payload : data, response : "success" });
+
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -532,7 +547,32 @@ async function callApi(url: string, data: IpaymentRes | IdefaultErrorRes,reqid:s
         error: error instanceof Error ? error.message : String(error),
       }),
     );
+
+    //Save Webhook in Logs
+    await saveResponse(reqid, "WEBHOOK", { url : url, payload : data, response : "failed" });
   }
+}
+
+async function saveResponse(transactionId,action,response) {
+  if(!transactionId){
+    return;
+  }
+  this.httpService.post(
+    `${process.env.INT_API_BASE_PATH}/transactions/save-transaction-response`, 
+    {
+      transactionId : transactionId,
+      "action":action,
+      response :this.utilsService.maskKeys(response,["stored_payment_method_id"])
+    }, 
+    {
+    headers: {
+      'api-int-key': ""
+    }
+  }).subscribe({
+    next: (response) => {},
+    error: (err) => {}
+  })
+  return;
 }
 
 async function getUOBTransactionStatus(transactionID: number, createdAt: string): Promise<string> {
@@ -654,6 +694,105 @@ async function getPaymentResponse(request: any): Promise<IpaymentRes> {
   }
 }
 
+async function getUOBPaymentResponse(request: any): Promise<IpaymentRes> {
+  let reqBody = request;
+
+  if (request.transaction) {
+    reqBody["auto_capture"] = (request.transaction.TransactionType == "AUTHORISATION") ? false : true;
+    reqBody["return_url"] = (reqBody?.return_url) ? reqBody?.return_url : {};
+    reqBody["merchant_id"] = request.transaction.DASMID;
+    reqBody["billing_address"] = (reqBody?.billing_address) ? reqBody?.billing_address : (request.transaction?.HPP?.billing_address || {});
+    reqBody["shipping_address"] = (reqBody?.shipping_address) ? reqBody?.shipping_address : (request.transaction?.HPP?.shipping_address || {});
+    reqBody["amount"] = (reqBody?.amount) ? reqBody?.amount : (request.transaction?.amount);
+    reqBody["currency"] = (reqBody?.currency) ? reqBody?.currency : (request.transaction?.CurrencyCode);
+    reqBody["merchant_txn_ref"] = (reqBody?.merchant_txn_ref) ? reqBody?.merchant_txn_ref : (request.transaction?.MerchantRefID || "");
+  }
+
+  reqBody.billing_address = {
+    "country": reqBody?.transaction?.bill_country || "",
+    "email": reqBody?.transaction?.bill_email || "",
+    "address1": reqBody?.transaction?.bill_address1 || "",
+    //"address2": reqBody?.transaction?.bill_address2 || "",
+    "city": reqBody?.transaction?.bill_city || "",
+    "state": reqBody?.transaction?.bill_state || "",
+    "postal_code": reqBody?.transaction?.bill_postal || "",
+    "phone_number": reqBody?.transaction?.bill_phone || "",
+  }
+
+  reqBody.shipping_address = {
+    "country": reqBody?.transaction?.ship_country || "",
+    "email": reqBody?.transaction?.ship_email || "",
+    "address1": reqBody?.transaction?.ship_address || "",
+    //"address2": reqBody?.transaction?.ship_address2 || "",
+    "city": reqBody?.transaction?.ship_city || "",
+    "state": reqBody?.transaction?.ship_state || "",
+    "postal_code": reqBody?.transaction?.ship_postal || "",
+    "phone_number": reqBody?.transaction?.ship_phone || "",
+  }
+
+  reqBody.return_url = {
+    success_url:reqBody?.transaction?.SuccessUrl,
+    cancel_url: reqBody?.transaction?.DeclineUrl
+  };
+  
+  return {
+    "success": false,
+    "status_code": 400,
+    "is_live": false,
+    "transaction_type": reqBody?.transaction?.TransactionType == "AUTHORISATION" ? "PRE_AUTH" : "CAPTURE",
+    "gateway_response": {
+      "version": "1",
+      "type": "ERROR",
+      "message": GATEWAY_ERROR,
+      "code": "ERR0002"
+    },
+    //"return_url_details": reqBody?.return_url || {},
+    "merchant_details": {
+      "legal_name": reqBody?.merchant?.LegalName || "",
+      "mid": reqBody.merchant_id || "",
+      "billing_details": {
+        "billing_address": reqBody.billing_address || {},
+        "shipping_address": reqBody.shipping_address || {}
+      },
+      "merchant_txn_ref": reqBody.merchant_txn_ref || ""
+      /*"device_details": {
+        ...(reqBody.link_generated_ip && { "visited_ip": reqBody.link_generated_ip || "", "merchant_ip": reqBody.link_generated_ip || "" }),
+        ...(reqBody.visit_ip && { "customer_ip": reqBody.visit_ip || "" }),
+      }*/
+    },
+    "payment_details": {
+      "amount": reqBody.amount || "",
+      "response_code": RESPONSE_CODE_ID,
+      "auth_code": null,
+      "currency": reqBody.currency,
+      "payment_method": reqBody?.transaction?.PaymentMethodType || "card",
+      "scheme": getSchemes(reqBody?.transaction),
+      "card": getCardInfo(reqBody?.transaction),
+      "additional_data":{
+          "payment_data_source":{
+             "type": "paynow"
+          },
+          ...(reqBody?.transaction?.additional_data?.serviceOptions && { "service_options": reqBody.transaction.additional_data.serviceOptions })
+        },
+      "responseDescription": reqBody?.transaction?.GatewayError || ""
+    },
+    "transaction_details": {
+      ...(reqBody?.transaction && {
+        "id": reqBody.transaction.uuid,
+        "ref": reqBody.transaction.ID,
+        "merchant_txn_ref": reqBody.merchant_txn_ref || "",
+        "timestamp": formatTransactionTimestamp(reqBody.transaction.TransactionDate)
+      })
+    },
+    ...(reqBody?.transaction?.Subscription && {
+      "subscription_details": {}
+    }),
+    "risk-details": {
+        "risk_score": null
+    }
+  }
+}
+
 function getSchemes(transaction: any) {
   /*if( (transaction?.PaymentMethodType !== "card" && !WalletWithScheme.includes(transaction?.PaymentMethodType)) || (transaction?.PaymentMethodType === transaction?.Scheme )) {
     return "";
@@ -723,6 +862,7 @@ exports.handler = async (event = {}) => {
       ok: true,
       window,
       transactionsUpdated: pendingResult.rowCount,
+      transactionsUOBUpdated: pendingUOBResult.rowCount,
       transactionIds: pendingResult.rows.map((row) => row.uuid),
       subscriptionsUpdated: subscriptionResult.rowCount,
       customerInfoDeleted: cleanupResult.rowCount,
